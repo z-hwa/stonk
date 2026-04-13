@@ -75,11 +75,20 @@ def _categorize_symbols(symbols):
     return full_list, incremental_groups
 
 
+_PRICE_FIELDS = {'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close'}
+
+
 def _flatten_columns(df):
-    """把 MultiIndex 欄位攤平成單層 (e.g. ('Close','NVDA') → 'Close')"""
+    """把 MultiIndex 欄位攤平成單層。
+    自動偵測哪一層是 Price 欄位 (yfinance 單檔/多檔下載的層級順序不同)"""
     if df.columns.nlevels > 1:
-        # 取第一層 (Open/High/Low/Close/Volume)，丟掉 Ticker 層
         df = df.copy()
+        # 找出哪一層的值符合 Price 欄位名
+        for lvl in range(df.columns.nlevels):
+            if set(df.columns.get_level_values(lvl)) & _PRICE_FIELDS:
+                df.columns = df.columns.get_level_values(lvl)
+                return df
+        # fallback: 取第一層
         df.columns = df.columns.get_level_values(0)
     return df
 
