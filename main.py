@@ -3,6 +3,7 @@ import sqlite3
 from engine import StockEngine
 from value_engine import ValueEngine
 from trade_engine import TradeTimingEngine
+from long_term_engine import LongTermEngine
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -27,6 +28,20 @@ def get_timing_watchlist():
     """從 .env 讀取交易時機監控清單"""
     raw = os.getenv("TIMING_WATCHLIST", "")
     return [s.strip() for s in raw.split(",") if s.strip()]
+
+def get_lt_watchlist():
+    """從 .env 讀取長期監控清單 (LT_WATCHLIST 為空則沿用 TIMING_WATCHLIST)"""
+    raw = os.getenv("LT_WATCHLIST", "") or os.getenv("TIMING_WATCHLIST", "")
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+def long_term_scan_job():
+    """長期 (年尺度) 掃描，每週執行一次"""
+    lt_list = get_lt_watchlist()
+    if not lt_list:
+        return
+    update_local_cache(symbols=lt_list)
+    lt_engine = LongTermEngine(lt_list)
+    lt_engine.run_long_term_scan()
 
 def daily_scan_job():
     """收盤後完整掃描：資料同步 → RSI → 價值 → 交易時機"""
@@ -82,6 +97,13 @@ def main():
         timing_scan_job,
         CronTrigger(day_of_week='mon-fri', hour=21, minute=0),
         id="timing_scan_job"
+    )
+
+    # 4. 長期 (年尺度) 掃描 (每週日 08:00 UTC+8，週末復盤)
+    scheduler.add_job(
+        long_term_scan_job,
+        CronTrigger(day_of_week='sun', hour=8, minute=0),
+        id="long_term_scan_job"
     )
 
     # 4. 心跳通知 (每 6 小時)
