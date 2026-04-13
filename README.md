@@ -3,11 +3,12 @@
 
 ## 資料庫設定
 執行 init_db.py
+expand_db.py
 
 ### 如何操作你的資料表？
 既然你是在 WSL 環境下，你可以直接透過指令來新增或刪除股票，不需要動到程式碼：
 
-進入 SQLite 終端： sqlite3 stocks.db
+進入 SQLite 終端： sqlite3 dataset/stocks.db
 
 查看目前的清單： SELECT * FROM watchlist;
 
