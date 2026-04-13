@@ -60,8 +60,8 @@ def daily_scan_job():
     # v_engine = ValueEngine(current_list)
     # v_engine.run_value_scan()
 
-    # 3. 交易時機掃描 (少量自選股)
-    timing_scan_job()
+    # # 3. 交易時機掃描 (少量自選股)
+    # timing_scan_job()
 
 def timing_scan_job():
     """盤前交易時機掃描 (僅自選股，不做全量)"""
@@ -85,7 +85,6 @@ def main():
         color=0x3498db)
 
     # 2. 收盤後完整掃描 (週一至週五 05:30 UTC+8，美股收盤後)
-    daily_scan_job()
     scheduler.add_job(
         daily_scan_job,
         CronTrigger(day_of_week='mon-fri', hour=5, minute=30),
@@ -100,6 +99,7 @@ def main():
     )
 
     # 4. 長期 (年尺度) 掃描 (每週日 08:00 UTC+8，週末復盤)
+    long_term_scan_job()
     scheduler.add_job(
         long_term_scan_job,
         CronTrigger(day_of_week='sun', hour=8, minute=0),

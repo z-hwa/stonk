@@ -21,6 +21,20 @@ from tqdm import tqdm
 
 load_dotenv()
 
+# --- 8 項成長指標權重 (黃金比例設計, Fibonacci 降冪) ---
+# 相鄰項比值 ≈ φ (1.618)，前兩項佔總權重 62.9%
+# 總權重 54，最高加權分數 = 2×54 = 108
+GROWTH_WEIGHTS = {
+    '收益修正': 21,     # Earnings Revisions
+    '獲利驚喜': 13,     # Earnings Surprise
+    '營收成長': 8,      # Revenue Growth
+    '營業利益率': 5,    # Operating Margin
+    '現金流量': 3,      # Cash Flow
+    '獲利': 2,          # Net Income
+    '獲利動能': 1,      # Earnings Momentum
+    'ROE': 1,           # Return on Equity
+}
+
 # --- Logger 設定 ---
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -152,43 +166,88 @@ class LongTermEngine:
 
     @staticmethod
     def _fetch_one_quarterly(symbol):
-        """抓取單檔季度資料 (供線程池使用)"""
+        """抓取單檔完整基本面資料 (供線程池使用)，涵蓋 8 項成長指標所需資料"""
         try:
             ticker = yf.Ticker(symbol)
+            data = {}
+
+            # === 1. 損益表 (營收、淨利、營業利益、EPS) ===
             income = ticker.quarterly_income_stmt
-            if income is None or income.empty:
+            if income is not None and not income.empty:
+                def _find_row(keys):
+                    for k in keys:
+                        if k in income.index:
+                            return income.loc[k].sort_index().dropna()
+                    return None
+
+                revenue = _find_row(['Total Revenue', 'Operating Revenue', 'Revenue'])
+                ni = _find_row(['Net Income', 'Net Income Common Stockholders',
+                                'Net Income Continuous Operations'])
+                op_income = _find_row(['Operating Income', 'Total Operating Income As Reported'])
+                eps = _find_row(['Diluted EPS', 'Basic EPS'])
+
+                if revenue is not None:
+                    data['revenue'] = [float(v) for v in revenue.values[-5:]]
+                if ni is not None:
+                    data['net_income'] = [float(v) for v in ni.values[-5:]]
+                if op_income is not None:
+                    data['op_income'] = [float(v) for v in op_income.values[-5:]]
+                if eps is not None:
+                    data['eps'] = [float(v) for v in eps.values[-5:]]
+
+            # === 2. 現金流量表 ===
+            cashflow = ticker.quarterly_cashflow
+            if cashflow is not None and not cashflow.empty:
+                def _find_cf(keys):
+                    for k in keys:
+                        if k in cashflow.index:
+                            return cashflow.loc[k].sort_index().dropna()
+                    return None
+                fcf = _find_cf(['Free Cash Flow'])
+                op_cf = _find_cf(['Operating Cash Flow', 'Cash Flow From Continuing Operating Activities'])
+                if fcf is not None:
+                    data['fcf'] = [float(v) for v in fcf.values[-5:]]
+                if op_cf is not None:
+                    data['op_cf'] = [float(v) for v in op_cf.values[-5:]]
+
+            # === 3. 獲利驚喜 (earnings_history) ===
+            try:
+                eh = ticker.earnings_history
+                if eh is not None and not eh.empty and 'surprisePercent' in eh.columns:
+                    surprises = eh['surprisePercent'].dropna().tolist()
+                    data['surprise'] = [float(v) for v in surprises[-4:]]
+            except Exception:
+                pass
+
+            # === 4. 收益修正 (eps_revisions) ===
+            try:
+                er = ticker.eps_revisions
+                if er is not None and not er.empty and '0q' in er.index:
+                    # 當季 (0q) 的上修 / 下修
+                    row = er.loc['0q']
+                    data['eps_rev_up'] = int(row.get('upLast30days', 0) or 0)
+                    data['eps_rev_down'] = int(row.get('downLast30days', 0) or 0)
+            except Exception:
+                pass
+
+            # === 5. ROE (從 info 拿，已預算好) ===
+            try:
+                info = ticker.info
+                roe = info.get('returnOnEquity')
+                if roe is not None:
+                    data['roe'] = float(roe)
+                # 備用：info 的即時營運指標
+                for k in ('operatingMargins', 'profitMargins'):
+                    v = info.get(k)
+                    if v is not None:
+                        data[k] = float(v)
+            except Exception:
+                pass
+
+            if not data.get('revenue'):
                 return symbol, None
-
-            # 找營收欄位 (yfinance 版本不同欄位名可能不同)
-            revenue_keys = ['Total Revenue', 'Operating Revenue', 'Revenue']
-            ni_keys = ['Net Income', 'Net Income Common Stockholders',
-                       'Net Income Continuous Operations']
-
-            def _find_row(keys):
-                for k in keys:
-                    if k in income.index:
-                        return income.loc[k]
-                return None
-
-            revenue = _find_row(revenue_keys)
-            ni = _find_row(ni_keys)
-
-            if revenue is None:
-                return symbol, None
-
-            # 由舊到新排序，取最近 5 季
-            revenue = revenue.sort_index().dropna()
-            data = {
-                'revenue': [float(v) for v in revenue.values[-5:]],
-                'revenue_dates': [d.strftime('%Y-%m-%d') for d in revenue.index[-5:]],
-            }
-            if ni is not None:
-                ni = ni.sort_index().dropna()
-                data['net_income'] = [float(v) for v in ni.values[-5:]]
-                data['ni_dates'] = [d.strftime('%Y-%m-%d') for d in ni.index[-5:]]
-
             return symbol, data
-        except Exception as e:
+        except Exception:
             return symbol, None
 
     def _prefetch_quarterly(self, cache, workers=5):
@@ -211,43 +270,207 @@ class LongTermEngine:
         self._save_quarterly_cache(cache)
         logger.info(f"季度資料抓取完成: 成功 {len(need)-failed}, 失敗 {failed}")
 
-    # --- 成長指標計算 ---
+    # --- 成長指標計算 (8 項) ---
+
+    @staticmethod
+    def _yoy(series):
+        """計算 YoY 成長率 (需要至少 5 季)"""
+        if len(series) >= 5 and series[-5] != 0:
+            return (series[-1] - series[-5]) / abs(series[-5])
+        return None
+
+    @staticmethod
+    def _qoq_trend(series):
+        """計算季度間成長趨勢"""
+        if len(series) < 4:
+            return None
+        qoq = [(series[i] - series[i-1]) / abs(series[i-1])
+               for i in range(1, len(series)) if series[i-1] != 0]
+        if not qoq:
+            return None
+        result = {
+            'avg': sum(qoq) / len(qoq),
+            'values': qoq,
+        }
+        if len(qoq) >= 3:
+            result['accelerating'] = qoq[-1] > qoq[-2] > qoq[-3]
+            result['decelerating'] = qoq[-1] < qoq[-2] < qoq[-3]
+        return result
 
     def _calc_growth_metrics(self, qdata):
-        """從 4-5 季資料計算成長指標"""
+        """
+        計算 8 項成長指標並產生 growth_score (0-16)
+        每項 0-2 分:
+          1. 收益修正  2. 獲利驚喜  3. 營收成長  4. 營業利益率
+          5. 現金流量  6. 獲利  7. 獲利動能  8. ROE
+        """
         if not qdata:
             return None
-        result = {}
 
-        # === 營收 ===
+        m = {}  # metrics
+        sub = {}  # 每項的得分 (0-2)
+
         rev = qdata.get('revenue', [])
-        if len(rev) >= 5 and rev[-5] > 0:
-            # YoY: 最近季 vs 一年前同季
-            result['rev_yoy'] = (rev[-1] - rev[-5]) / abs(rev[-5])
-
-        if len(rev) >= 4:
-            # 計算各季 QoQ 成長率
-            qoq = [(rev[i] - rev[i-1]) / abs(rev[i-1])
-                   for i in range(1, len(rev)) if rev[i-1] != 0]
-            if qoq:
-                result['rev_avg_qoq'] = sum(qoq) / len(qoq)
-                # 成長加速：最近 2 季比前 2 季快
-                if len(qoq) >= 3:
-                    result['rev_accelerating'] = qoq[-1] > qoq[-2] > qoq[-3]
-                    result['rev_decelerating'] = qoq[-1] < qoq[-2] < qoq[-3]
-
-        # === 淨利 ===
         ni = qdata.get('net_income', [])
-        if len(ni) >= 5 and ni[-5] != 0:
-            result['ni_yoy'] = (ni[-1] - ni[-5]) / abs(ni[-5])
+        eps = qdata.get('eps', [])
+        op_income = qdata.get('op_income', [])
+        fcf = qdata.get('fcf', [])
 
-        if len(ni) >= 1:
-            result['ni_now'] = ni[-1]
-            result['ni_negative'] = ni[-1] < 0
-        if len(ni) >= 2:
-            result['ni_declining'] = ni[-1] < ni[-2]
+        # === 1. 收益修正 (eps_revisions) ===
+        up = qdata.get('eps_rev_up', 0)
+        down = qdata.get('eps_rev_down', 0)
+        m['eps_rev_up'] = up
+        m['eps_rev_down'] = down
+        if up > down:
+            sub['收益修正'] = 2 if up >= 2 * max(down, 1) else 1
+        elif down > up:
+            sub['收益修正'] = -1  # 下修，後續用於賣出
+        else:
+            sub['收益修正'] = 0
 
-        return result
+        # === 2. 獲利驚喜 (earnings_history) ===
+        sur = qdata.get('surprise', [])
+        if sur:
+            m['surprise_last'] = sur[-1]
+            m['surprise_avg'] = sum(sur) / len(sur)
+            if m['surprise_avg'] > 0.05:
+                sub['獲利驚喜'] = 2
+            elif m['surprise_last'] > 0:
+                sub['獲利驚喜'] = 1
+            elif m['surprise_last'] < -0.05:
+                sub['獲利驚喜'] = -1  # 連續 miss
+            else:
+                sub['獲利驚喜'] = 0
+        else:
+            sub['獲利驚喜'] = 0
+
+        # === 3. 營收成長 ===
+        rev_yoy = self._yoy(rev)
+        rev_trend = self._qoq_trend(rev)
+        if rev_yoy is not None:
+            m['rev_yoy'] = rev_yoy
+            if rev_yoy > 0.25:
+                sub['營收成長'] = 2
+            elif rev_yoy > self.growth_min:
+                sub['營收成長'] = 1
+            elif rev_yoy < 0:
+                sub['營收成長'] = -1
+            else:
+                sub['營收成長'] = 0
+        else:
+            sub['營收成長'] = 0
+        if rev_trend:
+            m['rev_accelerating'] = rev_trend.get('accelerating', False)
+            m['rev_decelerating'] = rev_trend.get('decelerating', False)
+
+        # === 4. 營業利益率 (Operating Margin) ===
+        # 優先用最新季算 (op_income/revenue)，fallback 用 info
+        op_margin = None
+        if op_income and rev and rev[-1] > 0:
+            op_margin = op_income[-1] / rev[-1]
+        elif qdata.get('operatingMargins') is not None:
+            op_margin = qdata['operatingMargins']
+        if op_margin is not None:
+            m['op_margin'] = op_margin
+            # 檢查是否擴張 (最近季 vs 前 3 季平均)
+            op_expanding = False
+            if op_income and len(op_income) >= 4 and len(rev) >= 4:
+                past_margins = [op_income[i]/rev[i]
+                                for i in range(-4, -1) if rev[i] > 0]
+                if past_margins:
+                    prev_avg = sum(past_margins) / len(past_margins)
+                    op_expanding = op_margin > prev_avg * 1.02  # 擴張 >2%
+                    m['op_margin_expanding'] = op_expanding
+            if op_margin > 0.20:
+                sub['營業利益率'] = 2
+            elif op_margin > 0.10:
+                sub['營業利益率'] = 2 if op_expanding else 1
+            elif op_margin > 0:
+                sub['營業利益率'] = 1 if op_expanding else 0
+            else:
+                sub['營業利益率'] = -1
+        else:
+            sub['營業利益率'] = 0
+
+        # === 5. 現金流量 (Free Cash Flow) ===
+        if fcf:
+            m['fcf_last'] = fcf[-1]
+            fcf_yoy = self._yoy(fcf)
+            if fcf_yoy is not None:
+                m['fcf_yoy'] = fcf_yoy
+            if fcf[-1] > 0:
+                # 正向 FCF + 成長
+                if fcf_yoy is not None and fcf_yoy > 0.10:
+                    sub['現金流量'] = 2
+                else:
+                    sub['現金流量'] = 1
+            else:
+                sub['現金流量'] = -1
+        else:
+            sub['現金流量'] = 0
+
+        # === 6. 獲利 (Net Income) ===
+        if ni:
+            m['ni_last'] = ni[-1]
+            m['ni_negative'] = ni[-1] < 0
+            if ni[-1] > 0:
+                # 連續 4 季盈利?
+                all_positive = all(v > 0 for v in ni[-4:]) if len(ni) >= 4 else False
+                m['ni_4q_positive'] = all_positive
+                sub['獲利'] = 2 if all_positive else 1
+            else:
+                sub['獲利'] = -1
+            if len(ni) >= 2:
+                m['ni_declining'] = ni[-1] < ni[-2]
+        else:
+            sub['獲利'] = 0
+
+        # === 7. 獲利動能 (Earnings Momentum) ===
+        # 優先用 EPS，fallback 用 Net Income
+        mom_series = eps if eps else ni
+        mom_yoy = self._yoy(mom_series)
+        mom_trend = self._qoq_trend(mom_series)
+        if mom_yoy is not None:
+            m['earnings_momentum_yoy'] = mom_yoy
+            if mom_yoy > 0.30:
+                sub['獲利動能'] = 2
+            elif mom_yoy > self.growth_min:
+                # 成長加速額外加分
+                sub['獲利動能'] = 2 if mom_trend and mom_trend.get('accelerating') else 1
+            elif mom_yoy < 0:
+                sub['獲利動能'] = -1
+            else:
+                sub['獲利動能'] = 0
+        else:
+            sub['獲利動能'] = 0
+        if mom_trend:
+            m['earnings_accelerating'] = mom_trend.get('accelerating', False)
+            m['earnings_decelerating'] = mom_trend.get('decelerating', False)
+
+        # === 8. ROE ===
+        roe = qdata.get('roe')
+        if roe is not None:
+            m['roe'] = roe
+            if roe > 0.25:
+                sub['ROE'] = 2
+            elif roe > 0.15:
+                sub['ROE'] = 1
+            elif roe < 0:
+                sub['ROE'] = -1
+            else:
+                sub['ROE'] = 0
+        else:
+            sub['ROE'] = 0
+
+        # === 彙總：加權成長評分 (越前面越重要) ===
+        # 權重 8→1 線性遞減，max = 2×36 = +72, min = -1×36 = -36
+        weighted = sum(sub.get(k, 0) * w for k, w in GROWTH_WEIGHTS.items())
+        m['growth_score_raw'] = weighted  # 可為負
+        m['growth_score'] = max(0, weighted)
+        m['growth_score_max'] = 2 * sum(GROWTH_WEIGHTS.values())  # 72
+        m['subscores'] = sub
+
+        return m
 
     # --- 信號評估 ---
 
@@ -255,81 +478,256 @@ class LongTermEngine:
         signals = []
         price = float(close.iloc[-1])
 
-        # 1. 大盤健康 (1 分)
-        if market and market.get('sp_above_ma'):
-            signals.append(("大盤多頭", 1, "S&P>MA200"))
-
-        # 2. 恐慌買點 (2 分)
+        # === 個股/大盤技術面 ===
+        # 1. 恐慌買點 (2 分): VIX 恐慌 = 市場超跌 = 機會
         if market and market.get('panic') and not market.get('extreme_panic'):
             signals.append(("VIX恐慌", 2, f"VIX={market['vix_now']:.1f}"))
 
-        # 3. 個股大幅回檔 (2 分)
+        # 2. 個股大幅回檔 (2 分)
         high_52w = float(close.tail(252).max())
         drawdown = (price - high_52w) / high_52w
         if drawdown <= -self.drawdown_buy_pct:
             signals.append(("回檔機會", 2, f"距高點 {drawdown*100:+.1f}%"))
 
-        # 4. 長期趨勢仍在 (1 分) - 50 週 MA
+        # 3. 長期趨勢仍在 (1 分) - 50 週 MA
         ma250 = close.rolling(250).mean()
         if not pd.isna(ma250.iloc[-1]) and price > float(ma250.iloc[-1]):
-            signals.append(("長期多頭", 1, f"價格>MA250"))
+            signals.append(("長期多頭", 1, "價格>MA250"))
 
-        # 5. 營收成長 YoY (2 分) 或 QoQ fallback (1 分)
+        # === 基本面：加權 growth_score (0-108) ===
         if growth:
-            yoy = growth.get('rev_yoy')
-            if yoy is not None and yoy > self.growth_min:
-                signals.append(("營收YoY成長", 2, f"{yoy*100:+.1f}%"))
-            elif growth.get('rev_avg_qoq', 0) > self.growth_min / 4:
-                signals.append(("營收QoQ成長", 1,
-                                f"avg {growth['rev_avg_qoq']*100:+.1f}%"))
+            gs = growth.get('growth_score', 0)
+            gs_max = growth.get('growth_score_max', 108)
+            sub = growth.get('subscores', {})
+            strong_items = [f"{k}({v:+d})"
+                            for k, v in sub.items() if v > 0]
 
-        # 6. 淨利成長 YoY (2 分)
-        if growth and growth.get('ni_yoy', 0) > self.growth_min:
-            signals.append(("獲利YoY成長", 2, f"{growth['ni_yoy']*100:+.1f}%"))
-
-        # 7. 成長加速 (2 分)
-        if growth and growth.get('rev_accelerating'):
-            signals.append(("成長加速", 2, "近季逐步加速"))
+            pct = gs / gs_max if gs_max else 0
+            if pct >= 0.65:
+                signals.append(("基本面強勁", 4,
+                                f"GrowthScore={gs}/{gs_max} | " + " ".join(strong_items[:4])))
+            elif pct >= 0.40:
+                signals.append(("基本面良好", 3,
+                                f"GrowthScore={gs}/{gs_max} | " + " ".join(strong_items[:4])))
+            elif pct >= 0.20:
+                signals.append(("基本面尚可", 1, f"GrowthScore={gs}/{gs_max}"))
 
         return signals
 
     def _evaluate_sell(self, close, market, growth):
+        """
+        賣出評估 (max 約 18 分)
+
+        設計哲學：
+          - 單純技術破壞 → 不一定是賣出，可能是買進機會 (價值投資者 buy the dip)
+          - 技術破壞 + 基本面疲弱 → 真正危險 (多計 3 分 "雙殺" 確認)
+          - 基本面權重 > 技術面權重，符合年尺度投資邏輯
+
+        分層：
+          Tier 1 長期趨勢狀態 (合併計分, 0-5 分)
+          Tier 2 基本面 (0-4 分)
+          Tier 3 雙殺確認 (僅當技術+基本面同時惡化, +3 分)
+          Tier 4 大盤輔助 (0-2 分)
+          過熱風險 (獨立 2 分)
+          成長減速 (獨立 1-2 分)
+        """
         signals = []
         price = float(close.iloc[-1])
 
-        # 1. 跌破 50 週均線 (2 分)
+        # --- 計算技術指標 ---
+        ma50 = close.rolling(50).mean()
         ma250 = close.rolling(250).mean()
-        if not pd.isna(ma250.iloc[-1]) and price < float(ma250.iloc[-1]):
-            signals.append(("跌破MA250", 2, f"MA250={float(ma250.iloc[-1]):.2f}"))
-
-        # 2. 過熱風險 (2 分): 接近新高 + 大盤鬆懈
+        ma50_now = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else None
+        ma250_now = float(ma250.iloc[-1]) if not pd.isna(ma250.iloc[-1]) else None
         high_52w = float(close.tail(252).max())
-        from_high = (price - high_52w) / high_52w
-        if from_high >= -self.near_high_pct and market and market.get('complacent'):
+        drawdown = (price - high_52w) / high_52w
+
+        # === Tier 1: 長期趨勢狀態 (合併評分, 避免技術訊號過度堆積) ===
+        tech_pts = 0
+        tech_reasons = []
+        if ma250_now is not None and price < ma250_now:
+            tech_pts += 2
+            tech_reasons.append("價格<MA250")
+        if ma50_now is not None and ma250_now is not None and ma50_now < ma250_now:
+            tech_pts += 2
+            tech_reasons.append("長期死叉")
+        if drawdown <= -0.30:
+            tech_pts += 1
+            tech_reasons.append(f"距高點{drawdown*100:+.1f}%")
+
+        if tech_pts >= 4:
+            signals.append(("長期趨勢反轉", tech_pts, " + ".join(tech_reasons)))
+        elif tech_pts >= 2:
+            signals.append(("趨勢轉弱", tech_pts, " + ".join(tech_reasons)))
+
+        # === 短期動能訊號 (捕捉近期急跌，獨立於長期趨勢) ===
+        # 5 日跌幅 > 8%: 急跌
+        if len(close) >= 6:
+            drop_5d = (price - float(close.iloc[-6])) / float(close.iloc[-6])
+            if drop_5d <= -0.08:
+                signals.append(("近期急跌", 2, f"5日{drop_5d*100:+.1f}%"))
+
+        # 20 日跌幅 > 15%: 中期動能反轉
+        if len(close) >= 21:
+            drop_20d = (price - float(close.iloc[-21])) / float(close.iloc[-21])
+            if drop_20d <= -0.15:
+                signals.append(("中期崩跌", 2, f"20日{drop_20d*100:+.1f}%"))
+
+        # 跌破 MA50 (連續 2 天, 短期趨勢破壞)
+        if ma50_now is not None and len(ma50.dropna()) >= 2:
+            if price < ma50_now and float(close.iloc[-2]) < float(ma50.iloc[-2]):
+                signals.append(("跌破MA50", 1, f"MA50={ma50_now:.2f}"))
+
+        # === 過熱風險 (2 分): 接近新高 + 大盤鬆懈 ===
+        if drawdown >= -self.near_high_pct and market and market.get('complacent'):
             signals.append(("過熱風險", 2,
-                            f"近高點({from_high*100:+.1f}%) + VIX低"))
+                            f"近高點({drawdown*100:+.1f}%) + VIX鬆懈"))
 
-        # 3. 營收成長減速 (2 分)
-        if growth and growth.get('rev_decelerating'):
-            signals.append(("營收減速", 2, "連續減速"))
+        # === Tier 2: 基本面惡化 ===
+        gs_raw = 0
+        if growth:
+            gs_raw = growth.get('growth_score_raw', 0)
+            gs_max = growth.get('growth_score_max', 108)
+            sub = growth.get('subscores', {})
+            weak_items = [f"{k}({v:+d})" for k, v in sub.items() if v < 0]
 
-        # 4. 淨利衰退 (3 分): YoY 負成長
-        if growth and growth.get('ni_yoy') is not None and growth['ni_yoy'] < 0:
-            signals.append(("獲利衰退", 3, f"YoY={growth['ni_yoy']*100:+.1f}%"))
+            # 基本面惡化 (4 分): 加權 raw <= -15% max
+            if gs_raw <= -gs_max * 0.15:
+                signals.append(("基本面惡化", 4,
+                                f"Score={gs_raw}/{gs_max} | " + " ".join(weak_items[:4])))
+            elif gs_raw <= 0:
+                signals.append(("基本面疲弱", 2,
+                                f"Score={gs_raw}/{gs_max} | " + " ".join(weak_items[:3])))
 
-        # 5. 淨利為負 (3 分)
-        if growth and growth.get('ni_negative'):
-            signals.append(("近季虧損", 3, f"NI={growth.get('ni_now',0)/1e6:.1f}M"))
+            # 成長減速
+            rev_dec = growth.get('rev_decelerating', False)
+            eps_dec = growth.get('earnings_decelerating', False)
+            if rev_dec and eps_dec:
+                signals.append(("成長雙減速", 2, "營收+EPS逐季減速"))
+            elif rev_dec or eps_dec:
+                signals.append(("成長減速", 1,
+                                "營收減速" if rev_dec else "獲利減速"))
 
-        # 6. 大盤跌破 MA200 (1 分): 系統性風險
+        # === Tier 3: 雙殺確認 (技術破壞 + 基本面疲弱, +3 分) ===
+        # 單純技術破壞可能是買進機會；加上基本面疲弱才是真正危險
+        if tech_pts >= 3 and gs_raw <= 0 and growth:
+            signals.append(("技術基本面雙殺", 3,
+                            "長期趨勢破壞 + 基本面疲弱"))
+
+        # === Tier 4: 大盤輔助 ===
         if market and not market.get('sp_above_ma'):
             signals.append(("大盤走弱", 1, "S&P<MA200"))
-
-        # 7. VIX 極度恐慌 (1 分): 防禦性減碼
         if market and market.get('extreme_panic'):
             signals.append(("極度恐慌", 1, f"VIX={market['vix_now']:.1f}"))
 
         return signals
+
+    # --- 詳細分析 Log ---
+
+    def _log_detailed_analysis(self, symbol, price, close, market, growth,
+                                buy_sigs, sell_sigs,
+                                buy_score, sell_score, buy_level, sell_level):
+        """輸出詳細分析到 log (多行格式)"""
+        lines = []
+        lines.append(f"─────── {symbol} @ ${price:.2f} ───────")
+
+        # 結論摘要
+        bl = buy_level or "-"
+        sl = sell_level or "-"
+        lines.append(f"  結論: 買={buy_score}({bl}) | 賣={sell_score}({sl})")
+
+        # 技術面
+        ma50 = close.rolling(50).mean()
+        ma250 = close.rolling(250).mean()
+        ma50_v = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else None
+        ma250_v = float(ma250.iloc[-1]) if not pd.isna(ma250.iloc[-1]) else None
+        high_52w = float(close.tail(252).max())
+        low_52w = float(close.tail(252).min())
+        drawdown = (price - high_52w) / high_52w
+
+        tech_parts = [
+            f"距高點 {drawdown*100:+.1f}% (高 ${high_52w:.2f})",
+            f"距低點 +{(price/low_52w-1)*100:.1f}% (低 ${low_52w:.2f})",
+        ]
+        if ma50_v:
+            tech_parts.append(
+                f"MA50 ${ma50_v:.2f} ({'▲' if price > ma50_v else '▼'}{(price/ma50_v-1)*100:+.1f}%)"
+            )
+        if ma250_v:
+            tech_parts.append(
+                f"MA250 ${ma250_v:.2f} ({'▲' if price > ma250_v else '▼'}{(price/ma250_v-1)*100:+.1f}%)"
+            )
+        if ma50_v and ma250_v:
+            tech_parts.append(f"長期{'死叉⚠️' if ma50_v < ma250_v else '多頭'}")
+
+        # 短期動能
+        if len(close) >= 6:
+            drop_5d = (price - float(close.iloc[-6])) / float(close.iloc[-6])
+            tech_parts.append(f"5日 {drop_5d*100:+.1f}%")
+        if len(close) >= 21:
+            drop_20d = (price - float(close.iloc[-21])) / float(close.iloc[-21])
+            tech_parts.append(f"20日 {drop_20d*100:+.1f}%")
+
+        lines.append(f"  技術: {' | '.join(tech_parts)}")
+
+        # 大盤環境
+        if market:
+            mkt_parts = [
+                f"S&P {market['sp_now']:.0f} ({'多頭' if market['sp_above_ma'] else '空頭'})",
+                f"VIX {market['vix_now']:.1f} ({'😱恐慌' if market['panic'] else '😴鬆懈' if market['complacent'] else '🟡正常'})",
+            ]
+            lines.append(f"  大盤: {' | '.join(mkt_parts)}")
+
+        # 基本面細節 (8 項)
+        if growth:
+            gs_raw = growth.get('growth_score_raw', 0)
+            gs_max = growth.get('growth_score_max', 108)
+            pct = gs_raw / gs_max * 100 if gs_max else 0
+            sub = growth.get('subscores', {})
+
+            lines.append(f"  成長評分: {gs_raw:+d}/{gs_max} ({pct:+.0f}%)")
+            # 8 項分數表，依權重排序
+            for k, w in GROWTH_WEIGHTS.items():
+                v = sub.get(k, 0)
+                marker = "✅" if v > 0 else ("❌" if v < 0 else "⚪")
+                contrib = v * w
+                lines.append(f"    {marker} {k:<6s} 權重×{w:>2d}  分數 {v:+d}  貢獻 {contrib:+d}")
+
+            # 基本面原始數據
+            raw_parts = []
+            if 'rev_yoy' in growth:
+                raw_parts.append(f"營收YoY={growth['rev_yoy']*100:+.1f}%")
+            if 'earnings_momentum_yoy' in growth:
+                raw_parts.append(f"EPS YoY={growth['earnings_momentum_yoy']*100:+.1f}%")
+            if 'op_margin' in growth:
+                raw_parts.append(f"營業利益率={growth['op_margin']*100:.1f}%")
+            if 'roe' in growth:
+                raw_parts.append(f"ROE={growth['roe']*100:.1f}%")
+            if 'surprise_avg' in growth:
+                raw_parts.append(f"獲利驚喜={growth['surprise_avg']*100:+.1f}%")
+            if 'eps_rev_up' in growth or 'eps_rev_down' in growth:
+                up = growth.get('eps_rev_up', 0)
+                down = growth.get('eps_rev_down', 0)
+                raw_parts.append(f"分析師 上修{up}/下修{down}")
+            if raw_parts:
+                lines.append(f"  原始指標: {' | '.join(raw_parts)}")
+
+        # 觸發訊號列表
+        if buy_sigs:
+            sig_str = " + ".join(f"{n}(+{w})" for n, w, _ in buy_sigs)
+            lines.append(f"  買入訊號: {sig_str}")
+            for n, w, d in buy_sigs:
+                lines.append(f"    • {n} [+{w}]: {d}")
+        if sell_sigs:
+            sig_str = " + ".join(f"{n}(+{w})" for n, w, _ in sell_sigs)
+            lines.append(f"  賣出訊號: {sig_str}")
+            for n, w, d in sell_sigs:
+                lines.append(f"    • {n} [+{w}]: {d}")
+
+        if not buy_sigs and not sell_sigs:
+            lines.append(f"  (無觸發訊號)")
+
+        logger.info("\n".join(lines))
 
     # --- Discord ---
 
@@ -392,25 +790,22 @@ class LongTermEngine:
                 buy_score = sum(w for _, w, _ in buy_sigs)
                 sell_score = sum(w for _, w, _ in sell_sigs)
 
+                # 買入 max ≈ 9 分: STRONG>=7 (78%)
                 buy_level = ("STRONG BUY" if buy_score >= 7
                              else "BUY" if buy_score >= self.buy_notify_min
                              else "WATCH" if buy_score >= 1 else None)
-                sell_level = ("STRONG SELL" if sell_score >= 6
+                # 賣出 max ≈ 18 分: STRONG>=9 (50%, 需雙殺觸發才會到)
+                sell_level = ("STRONG SELL" if sell_score >= 9
                               else "SELL" if sell_score >= self.sell_notify_min
                               else "CAUTION" if sell_score >= 1 else None)
 
                 price = float(close.iloc[-1])
-                growth_str = ""
-                if growth:
-                    if 'rev_yoy' in growth:
-                        growth_str += f"營收YoY={growth['rev_yoy']*100:+.1f}% "
-                    if 'ni_yoy' in growth:
-                        growth_str += f"淨利YoY={growth['ni_yoy']*100:+.1f}%"
-                logger.info(
-                    f"{symbol:6s} | ${price:8.2f} | "
-                    f"買={buy_score}({buy_level or '-':>11s}) | "
-                    f"賣={sell_score}({sell_level or '-':>12s}) | "
-                    f"{growth_str}"
+
+                # === 詳細分析 log (多行結構化輸出) ===
+                self._log_detailed_analysis(
+                    symbol, price, close, market, growth,
+                    buy_sigs, sell_sigs,
+                    buy_score, sell_score, buy_level, sell_level
                 )
 
                 if buy_level and buy_level != "WATCH":
