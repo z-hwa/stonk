@@ -61,8 +61,8 @@ def _categorize_symbols(symbols):
 
         days_old = (today - last_date).days
 
-        if days_old <= 0:
-            # 已經是今天的資料，跳過
+        if days_old <= 1:
+            # 今天或昨天的資料 → 跳過 (美股可能尚未收盤，避免 start > end 錯誤)
             continue
         elif days_old > FULL_REFRESH_DAYS:
             # 太久沒更新，重抓全量 (避免漏掉拆股/股息調整)

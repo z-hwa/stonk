@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from long_term_engine import LongTermEngine, GROWTH_WEIGHTS
+from profit_taking_engine import ProfitTakingEngine
 
 load_dotenv()
 
@@ -345,6 +346,7 @@ class BacktestPortfolio:
 
         self.positions = {}  # sym -> {shares, entry_price, entry_date, entry_value}
         self.cooldown = {}   # sym -> date可再買日
+        self.waiting_reentry = {}  # sym -> {exit_price, exit_date} 獲利了結後等重入場
         self.trades = []     # 完成的交易紀錄
         self.equity_curve = []  # [(date, total_value)]
 
@@ -402,6 +404,46 @@ class BacktestPortfolio:
         self.cooldown[sym] = date + timedelta(days=self.cooldown_days)
         return True
 
+    def sell_profit_take(self, sym, price, date, reason=""):
+        """獲利了結: 賣出後進入 waiting_reentry (不進 cooldown)"""
+        if sym not in self.positions:
+            return False
+        pos = self.positions[sym]
+        proceeds = pos['shares'] * price * (1 - self.cost_pct)
+        pnl = proceeds - pos['entry_value']
+        pnl_pct = pnl / pos['entry_value']
+        hold_days = (date - pos['entry_date']).days
+        self.cash += proceeds
+        self.trades.append({
+            'symbol': sym,
+            'entry_date': pos['entry_date'].strftime('%Y-%m-%d'),
+            'entry_price': round(pos['entry_price'], 2),
+            'exit_date': date.strftime('%Y-%m-%d'),
+            'exit_price': round(price, 2),
+            'shares': round(pos['shares'], 2),
+            'pnl': round(pnl, 2),
+            'pnl_pct': round(pnl_pct * 100, 2),
+            'hold_days': hold_days,
+            'reason': f"[PT] {reason}",
+        })
+        self.waiting_reentry[sym] = {'exit_price': price, 'exit_date': date}
+        del self.positions[sym]
+        return True
+
+    def can_reentry(self, sym, date):
+        return (sym in self.waiting_reentry and
+                sym not in self.positions and
+                len(self.positions) < self.max_positions)
+
+    def reentry_buy(self, sym, price, date):
+        """重新入場: 從 waiting_reentry 移出"""
+        if not self.can_reentry(sym, date):
+            return False
+        if not self.buy(sym, price, date):
+            return False
+        self.waiting_reentry.pop(sym, None)
+        return True
+
     def total_value(self, date, get_price_fn):
         v = self.cash
         for sym, pos in self.positions.items():
@@ -419,8 +461,16 @@ class BacktestEngine:
     def __init__(self, watchlist, start_date=None, end_date=None,
                  initial_cash=100_000, freq='W-MON',
                  buy_notify_min=4, sell_notify_min=8,
-                 strong_buy_min=7, strong_sell_min=9):
+                 strong_buy_min=7, strong_sell_min=9,
+                 mode='combined'):
+        """
+        mode:
+          'lt_only'   — 僅 LongTermEngine 買賣
+          'pt_only'   — LT 買入 + PT 獲利回收/重入 (不用 LT sell)
+          'combined'  — LT 買賣 + PT 獲利回收/重入 (完整版)
+        """
         self.watchlist = watchlist
+        self.mode = mode
         # 預設回測過去 3 年
         if end_date is None:
             end_date = datetime.now().date()
@@ -438,8 +488,8 @@ class BacktestEngine:
         self.loader = BacktestDataLoader(years=5)
         self.portfolio = BacktestPortfolio(initial_cash=initial_cash)
 
-        # 複用 LongTermEngine 的純評估方法 (需要 instance 存取 self.drawdown_buy_pct 等)
         self.engine = LongTermEngine(watchlist=[])
+        self.pt_engine = ProfitTakingEngine(watchlist=[])
 
     def _get_price_at(self, sym, date):
         close = self.loader.get_price_upto(sym, date)
@@ -464,11 +514,42 @@ class BacktestEngine:
             'growth_score': growth.get('growth_score_raw') if growth else None,
         }
 
+    def _eval_pt_signals(self, sym, date, entry_price):
+        """評估獲利回收 / 重新入場訊號"""
+        df = self.loader.prices.get(sym)
+        if df is None or df.empty:
+            return None, None
+
+        close = df['Close'].loc[:date] if 'Close' in df.columns else None
+        if close is None or len(close) < 20:
+            return None, None
+
+        # 建構 ohlcv dict
+        ohlcv = {}
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col in df.columns:
+                s = df[col].loc[:date]
+                ohlcv[col.lower()] = s
+
+        if 'close' not in ohlcv:
+            return None, None
+
+        price = float(ohlcv['close'].iloc[-1])
+
+        if entry_price and entry_price > 0:
+            pt_sigs = self.pt_engine.evaluate_profit_take(ohlcv, entry_price)
+            return pt_sigs, price
+        else:
+            re_sigs = self.pt_engine.evaluate_reentry(ohlcv)
+            return re_sigs, price
+
     def run(self):
-        print(f"🔬 回測開始: {self.start_date.date()} → {self.end_date.date()}")
-        logger.info(f"========== 回測 {self.start_date.date()} → {self.end_date.date()} ==========")
+        mode_label = {'lt_only': 'LT Only', 'pt_only': 'PT Only', 'combined': 'LT+PT'}
+        label = mode_label.get(self.mode, self.mode)
+        print(f"🔬 回測 [{label}]: {self.start_date.date()} → {self.end_date.date()}")
+        logger.info(f"========== 回測 [{label}] {self.start_date.date()} → {self.end_date.date()} ==========")
         logger.info(f"Watchlist: {self.watchlist}")
-        logger.info(f"初始資金: ${self.portfolio.initial_cash:,}")
+        logger.info(f"初始資金: ${self.portfolio.initial_cash:,} | mode={self.mode}")
 
         # 資料準備
         self.loader.prepare_all(self.watchlist)
@@ -477,25 +558,58 @@ class BacktestEngine:
         dates = pd.date_range(self.start_date, self.end_date, freq=self.freq)
         print(f"  共 {len(dates)} 個評估時點 ({self.freq})")
 
-        for date in tqdm(dates, desc="回測中", unit="週"):
-            # 1. 評估所有標的訊號
+        use_lt_sell = self.mode in ('lt_only', 'combined')
+        use_pt = self.mode in ('pt_only', 'combined')
+
+        for date in tqdm(dates, desc=f"回測({label})", unit="週"):
+            # 1. 評估所有標的 LT 訊號
             signals = {}
             for sym in self.watchlist:
                 s = self._eval_signals(sym, date)
                 if s:
                     signals[sym] = s
 
-            # 2. 先處理賣出 (釋放資金)
-            for sym, s in signals.items():
-                if sym in self.portfolio.positions and s['sell_score'] >= self.sell_min:
-                    reason = f"SellScore={s['sell_score']}: " + "+".join(n for n,_,_ in s['sell_sigs'][:3])
-                    self.portfolio.sell(sym, s['price'], date, reason)
-                    logger.info(f"[{date.date()}] SELL {sym} @${s['price']:.2f} | {reason}")
+            # === 優先級: LT_SELL > PT_SELL > PT_REENTRY > LT_BUY ===
 
-            # 3. 買入 (按 buy_score 降冪排序)
+            # 2a. LT 棄守賣出
+            if use_lt_sell:
+                for sym, s in signals.items():
+                    if sym in self.portfolio.positions and s['sell_score'] >= self.sell_min:
+                        reason = f"SellScore={s['sell_score']}: " + "+".join(n for n,_,_ in s['sell_sigs'][:3])
+                        self.portfolio.sell(sym, s['price'], date, reason)
+                        self.portfolio.waiting_reentry.pop(sym, None)
+                        logger.info(f"[{date.date()}] LT_SELL {sym} @${s['price']:.2f} | {reason}")
+
+            # 2b. PT 獲利回收
+            if use_pt:
+                for sym in list(self.portfolio.positions.keys()):
+                    pos = self.portfolio.positions[sym]
+                    pt_sigs, price = self._eval_pt_signals(sym, date, pos['entry_price'])
+                    if pt_sigs is None:
+                        continue
+                    pt_score = sum(w for _, w, _ in pt_sigs)
+                    if pt_score >= self.pt_engine.sell_notify_min:
+                        reason = f"PTScore={pt_score}: " + "+".join(n for n,_,_ in pt_sigs[:3])
+                        self.portfolio.sell_profit_take(sym, price, date, reason)
+                        logger.info(f"[{date.date()}] PT_SELL {sym} @${price:.2f} | {reason}")
+
+            # 3a. PT 重新入場
+            if use_pt:
+                for sym in list(self.portfolio.waiting_reentry.keys()):
+                    re_sigs, price = self._eval_pt_signals(sym, date, None)
+                    if re_sigs is None:
+                        continue
+                    re_score = sum(w for _, w, _ in re_sigs)
+                    if re_score >= self.pt_engine.reentry_notify_min:
+                        if self.portfolio.reentry_buy(sym, price, date):
+                            reason = f"ReentryScore={re_score}: " + "+".join(n for n,_,_ in re_sigs[:3])
+                            logger.info(f"[{date.date()}] REENTRY {sym} @${price:.2f} | {reason}")
+
+            # 3b. LT 新買入
             buy_candidates = [(sym, s) for sym, s in signals.items()
                               if s['buy_score'] >= self.buy_min
-                              and self.portfolio.can_buy(sym, date)]
+                              and self.portfolio.can_buy(sym, date)
+                              and sym not in self.portfolio.waiting_reentry]
             buy_candidates.sort(key=lambda x: x[1]['buy_score'], reverse=True)
 
             for sym, s in buy_candidates:
@@ -558,8 +672,10 @@ class BacktestEngine:
 
         # === 終端報告 ===
         lines = []
+        mode_label = {'lt_only': 'LT Only', 'pt_only': 'PT Only', 'combined': 'LT+PT'}
+        label = mode_label.get(self.mode, self.mode)
         lines.append("\n" + "="*70)
-        lines.append(f"📊 回測結果 ({self.start_date.date()} → {self.end_date.date()})")
+        lines.append(f"📊 回測結果 [{label}] ({self.start_date.date()} → {self.end_date.date()})")
         lines.append("="*70)
         lines.append(f"  初始資金:    ${init_v:>12,.0f}")
         lines.append(f"  結束資金:    ${final_v:>12,.0f}")
@@ -620,10 +736,79 @@ class BacktestEngine:
 
 
 if __name__ == "__main__":
+    import sys
     raw = os.getenv("LT_WATCHLIST") or os.getenv("TIMING_WATCHLIST", "")
     watchlist = [s.strip() for s in raw.split(",") if s.strip()]
     if not watchlist:
         print("請在 .env 設定 TIMING_WATCHLIST")
+        sys.exit(1)
+
+    # 支援命令列指定模式: python backtest_engine.py [lt_only|pt_only|combined|compare]
+    arg = sys.argv[1] if len(sys.argv) > 1 else 'compare'
+
+    if arg == 'compare':
+        # 跑 3 種模式對比
+        results = {}
+        shared_loader = None
+
+        for mode in ['lt_only', 'pt_only', 'combined']:
+            bt = BacktestEngine(watchlist=watchlist, mode=mode)
+            if shared_loader is not None:
+                bt.loader = shared_loader  # 共用資料，不重複下載
+            bt.run()
+            if shared_loader is None:
+                shared_loader = bt.loader
+
+            # 收集摘要
+            eq = bt.portfolio.equity_curve
+            trades = bt.portfolio.trades
+            init_v = bt.portfolio.initial_cash
+            final_v = bt.portfolio.cash
+            total_ret = (final_v - init_v) / init_v
+            years = (bt.end_date - bt.start_date).days / 365
+            annual_ret = ((final_v / init_v) ** (1/years) - 1) if years > 0 else 0
+            values = np.array([v for _, v in eq])
+            running_max = np.maximum.accumulate(values)
+            max_dd = ((values - running_max) / running_max).min()
+            wins = [t for t in trades if t['pnl'] > 0]
+            win_rate = len(wins) / len(trades) if trades else 0
+
+            if len(values) > 1:
+                rets = np.diff(values) / values[:-1]
+                sharpe = np.sqrt(52) * rets.mean() / rets.std() if rets.std() > 0 else 0
+            else:
+                sharpe = 0
+
+            results[mode] = {
+                'total_ret': total_ret,
+                'annual_ret': annual_ret,
+                'max_dd': max_dd,
+                'sharpe': sharpe,
+                'trades': len(trades),
+                'win_rate': win_rate,
+                'final': final_v,
+            }
+
+        # SPY
+        spy_start = shared_loader.spy_close.iloc[0]
+        spy_end = shared_loader.spy_close.iloc[-1]
+        spy_ret = (float(spy_end) - float(spy_start)) / float(spy_start)
+
+        # 對比表
+        print("\n" + "="*75)
+        print("📊 三種模式對比")
+        print("="*75)
+        header = f"{'指標':<14s} {'LT Only':>12s} {'PT Only':>12s} {'LT+PT':>12s} {'SPY B&H':>12s}"
+        print(header)
+        print("-"*75)
+        print(f"{'總報酬':　<12s} {results['lt_only']['total_ret']*100:>+11.2f}% {results['pt_only']['total_ret']*100:>+11.2f}% {results['combined']['total_ret']*100:>+11.2f}% {spy_ret*100:>+11.2f}%")
+        print(f"{'年化報酬':　<11s} {results['lt_only']['annual_ret']*100:>+11.2f}% {results['pt_only']['annual_ret']*100:>+11.2f}% {results['combined']['annual_ret']*100:>+11.2f}%")
+        print(f"{'最大回撤':　<11s} {results['lt_only']['max_dd']*100:>+11.2f}% {results['pt_only']['max_dd']*100:>+11.2f}% {results['combined']['max_dd']*100:>+11.2f}%")
+        print(f"{'Sharpe':　<12s} {results['lt_only']['sharpe']:>12.2f} {results['pt_only']['sharpe']:>12.2f} {results['combined']['sharpe']:>12.2f}")
+        print(f"{'交易數':　<12s} {results['lt_only']['trades']:>12d} {results['pt_only']['trades']:>12d} {results['combined']['trades']:>12d}")
+        print(f"{'勝率':　<13s} {results['lt_only']['win_rate']*100:>11.1f}% {results['pt_only']['win_rate']*100:>11.1f}% {results['combined']['win_rate']*100:>11.1f}%")
+        print(f"{'結束資金':　<11s} ${results['lt_only']['final']:>11,.0f} ${results['pt_only']['final']:>11,.0f} ${results['combined']['final']:>11,.0f}")
+        print("="*75)
     else:
-        engine = BacktestEngine(watchlist=watchlist)
+        engine = BacktestEngine(watchlist=watchlist, mode=arg)
         engine.run()

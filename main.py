@@ -4,6 +4,7 @@ from engine import StockEngine
 from value_engine import ValueEngine
 from trade_engine import TradeTimingEngine
 from long_term_engine import LongTermEngine
+from profit_taking_engine import ProfitTakingEngine
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -64,13 +65,17 @@ def daily_scan_job():
     # timing_scan_job()
 
 def timing_scan_job():
-    """盤前交易時機掃描 (僅自選股，不做全量)"""
+    """盤前交易時機掃描 + 獲利回收 (僅自選股)"""
     timing_list = get_timing_watchlist()
     if not timing_list:
         return
     update_local_cache(symbols=timing_list)  # 只更新自選股
+
     t_engine = TradeTimingEngine(timing_list)
     t_engine.run_timing_scan()
+
+    pt_engine = ProfitTakingEngine(timing_list)
+    pt_engine.run_profit_scan()
 
 def main():
     scheduler = BlockingScheduler()
@@ -80,7 +85,7 @@ def main():
     # 1. 啟動通知
     system_engine.send_discord("系統狀態",
         "🚀 監控排程系統已啟動\n"
-        "模式：SQLite 動態清單 + 交易時機監控\n"
+        "模式：交易時機 + 獲利回收 + 長期掃描\n"
         f"時區：UTC+8 | 時間：`{datetime.now()}`",
         color=0x3498db)
 
@@ -92,6 +97,7 @@ def main():
     )
 
     # 3. 盤前時機掃描 (週一至週五 21:00 UTC+8，美股 21:30 開盤前)
+    timing_scan_job()
     scheduler.add_job(
         timing_scan_job,
         CronTrigger(day_of_week='mon-fri', hour=21, minute=0),
@@ -116,7 +122,7 @@ def main():
     )
 
     print("排程器運行中... (UTC+8)")
-    print("  05:30 收盤後掃描 | 21:00 盤前時機掃描 | 每6h 心跳")
+    print("  05:30 收盤後掃描 | 21:00 盤前(時機+獲利回收) | 週日08:00 長期 | 每6h 心跳")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
