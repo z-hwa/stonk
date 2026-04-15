@@ -4,3 +4,6 @@ cache
 __pycache__
 *log
 *csv
+
+google-cloud-sdk/*
+*tar.gz

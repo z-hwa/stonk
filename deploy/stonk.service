@@ -1,0 +1,19 @@
+[Unit]
+Description=Stonk scheduler (main.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stonk
+WorkingDirectory=/opt/stonk
+EnvironmentFile=/opt/stonk/.env
+# 改成你的 conda env 路徑 (which python 看一下)
+ExecStart=/opt/conda/envs/quant/bin/python main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

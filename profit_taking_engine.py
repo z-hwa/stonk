@@ -10,12 +10,13 @@ ProfitTakingEngine — 獲利回收 + 重新入場引擎
 
 import pandas as pd
 import os
-import json
 import logging
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+from positions_store import get_store
 
 load_dotenv()
 
@@ -36,7 +37,7 @@ class ProfitTakingEngine:
     def __init__(self, watchlist):
         self.watchlist = watchlist
         self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
-        self.positions_path = os.path.join(self.cache_dir, "_positions.json")
+        self.positions_store = get_store()
         self.webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
 
         self.atr_trail_mult = float(os.getenv("PT_ATR_TRAIL_MULT", 2.0))
@@ -216,13 +217,7 @@ class ProfitTakingEngine:
         print(f"[{datetime.now()}] 啟動獲利回收掃描...")
         logger.info("========== 獲利回收掃描開始 ==========")
 
-        positions = {}
-        if os.path.exists(self.positions_path):
-            try:
-                with open(self.positions_path) as f:
-                    positions = json.load(f)
-            except Exception:
-                pass
+        positions = self.positions_store.load()
 
         take_profit_alerts = []
         reentry_alerts = []

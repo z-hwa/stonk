@@ -28,6 +28,11 @@ data_manager.py         — 增量快取 OHLCV (parquet)
 value_engine.py         — 價值選股 (PE, 市值, 位階)
 engine.py               — RSI 超賣掃描
 expand_db.py            — 從 NASDAQ Trader + S&P 指數擴充 watchlist
+
+positions_store.py      — 持倉儲存抽象 (local 檔案 / GCS)
+positions_server.py     — FastAPI Web UI (Cloud Run)
+Dockerfile              — Cloud Run image
+deploy/                 — 部署腳本 (cloud_run.sh, install_vm.sh, stonk.service)
 ```
 
 ---
@@ -232,8 +237,102 @@ cache/
 ├── *.parquet              # 個股 2 年 OHLCV (日常用)
 ├── _fundamentals.json     # PE/市值快取 (7 天有效)
 ├── _quarterly.json        # 季度基本面 (14 天有效)
-├── _positions.json        # 手動持倉記錄 (獲利回收用)
+├── _positions.json        # 手動持倉記錄 (獲利回收用,線上用 GCS 取代)
 └── backtest/
     ├── *.parquet          # 5 年 OHLCV (回測專用)
     └── _annual.json       # 年度基本面 (回測用)
 ```
+
+---
+
+## 部署 (Cloud Run + VM)
+
+混合架構,共用 GCS 上的 `_positions.json`,費用在免費層內 **$0/月**:
+
+```
+┌──────────────────┐     讀/寫     ┌────────────────────┐
+│  VM (always-on)  │ ───────────▶  │  GCS bucket        │
+│  main.py 排程    │               │  _positions.json   │
+└──────────────────┘               └────────────────────┘
+                                            ▲
+                                            │ 讀/寫
+                                   ┌────────┴───────────┐
+                                   │  Cloud Run         │
+                                   │  positions_server  │ ◀── 手機/瀏覽器
+                                   │  (scale to zero)   │
+                                   └────────────────────┘
+```
+
+VM 選擇(都能跑):
+- **Oracle Cloud Always Free** (x86 1 vCPU/1GB,永久免費)
+- **GCP e2-micro** (1GB,僅 us-west/central/east1 免費)
+- **Hetzner CAX11** (~$3.60/月,2 ARM core/4GB)
+
+### 1. 部署 Web UI 到 Cloud Run
+
+```bash
+gcloud auth login
+gcloud auth login --no-launch-browser
+
+export GCP_PROJECT=your-project-id
+export POSITIONS_TOKEN=$(openssl rand -hex 24)
+bash deploy/cloud_run.sh
+```
+
+腳本會自動:啟用 API → 建 GCS bucket → 建 service account → 授權 → build & deploy。
+
+完成後印出 `https://stonk-positions-xxx.run.app/?token=...`,直接收藏這個網址。
+
+### 2. 部署排程器到 VM
+
+```bash
+# 在你的 VM 上 (Ubuntu/Debian)
+sudo bash deploy/install_vm.sh https://github.com/<you>/stonk.git
+```
+
+腳本會:裝 Miniconda → clone repo → 建 quant env → 裝依賴 → 註冊 systemd。
+
+接著建立 `/opt/stonk/.env`(從 `.env.example` 複製),補上 GCS 相關設定:
+
+```env
+POSITIONS_BACKEND=gcs
+POSITIONS_GCS_BUCKET=<與 Cloud Run 同一個 bucket>
+GOOGLE_APPLICATION_CREDENTIALS=/opt/stonk/sa-key.json
+```
+
+`sa-key.json` 從本機產生後 scp 到 VM:
+
+```bash
+gcloud iam service-accounts keys create sa-key.json \
+  --iam-account=stonk-positions-sa@$GCP_PROJECT.iam.gserviceaccount.com
+scp sa-key.json user@vm:/opt/stonk/sa-key.json
+```
+
+完成後啟動服務:
+
+```bash
+sudo systemctl restart stonk
+sudo journalctl -u stonk -f          # 看即時日誌
+```
+
+---
+
+## Web UI 用法
+
+打開 `https://stonk-positions-xxx.run.app/?token=...`:
+
+- 表格顯示所有持倉,每列右側 `×` 按鈕刪除(會跳確認)
+- 下方表單新增/更新 — 同 symbol 會直接覆蓋
+- 手機友善,可加到主畫面當 PWA 用
+- 改完即時生效,VM 端下次掃描就讀到新資料
+
+API 端點:
+
+| 方法 | 路徑 | body | 用途 |
+|------|------|------|------|
+| GET  | `/`         | -                                 | HTML UI |
+| POST | `/add`      | `symbol, entry_price, entry_date` | 新增/更新 |
+| POST | `/remove`   | `symbol`                          | 刪除 |
+| GET  | `/healthz`  | -                                 | 健康檢查 |
+
+所有請求需帶 `?token=...` 或 `Authorization: Bearer ...`。

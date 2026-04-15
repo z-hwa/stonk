@@ -1,11 +1,12 @@
 import pandas as pd
 import os
-import json
 import logging
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+from positions_store import get_store
 
 load_dotenv()
 
@@ -29,7 +30,7 @@ class TradeTimingEngine:
         self.watchlist = watchlist
         self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
         self.webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-        self.positions_path = os.path.join(self.cache_dir, "_positions.json")
+        self.positions_store = get_store()
 
         # 可從 .env 調整的參數
         self.rsi_oversold = int(os.getenv("TIMING_RSI_OVERSOLD", 30))
@@ -71,16 +72,10 @@ class TradeTimingEngine:
             'volume': df['Volume'],
         }
 
-    # --- 持倉追蹤 (手動編輯 _positions.json) ---
+    # --- 持倉追蹤 (positions_store: local 檔案 或 GCS) ---
 
     def _load_positions(self):
-        if os.path.exists(self.positions_path):
-            try:
-                with open(self.positions_path, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, KeyError):
-                pass
-        return {}
+        return self.positions_store.load()
 
     # --- 技術指標計算 ---
 
