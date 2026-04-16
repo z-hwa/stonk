@@ -7,3 +7,5 @@ __pycache__
 
 google-cloud-sdk/*
 *tar.gz
+
+sa-key.json
