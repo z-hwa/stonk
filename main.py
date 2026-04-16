@@ -77,9 +77,12 @@ def timing_scan_job():
     pt_engine = ProfitTakingEngine(timing_list)
     pt_engine.run_profit_scan()
 
-def main():
-    scheduler = BlockingScheduler()
+from pytz import timezone
 
+def main():
+    tw_tz = timezone('Asia/Taipei')
+    scheduler = BlockingScheduler(timezone=tw_tz)
+    
     system_engine = StockEngine([])
 
     # 1. 啟動通知
