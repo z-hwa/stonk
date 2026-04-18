@@ -71,8 +71,8 @@ def timing_scan_job():
         return
     update_local_cache(symbols=timing_list)  # 只更新自選股
 
-    t_engine = TradeTimingEngine(timing_list)
-    t_engine.run_timing_scan()
+    # t_engine = TradeTimingEngine(timing_list)
+    # t_engine.run_timing_scan()
 
     pt_engine = ProfitTakingEngine(timing_list)
     pt_engine.run_profit_scan()
@@ -93,29 +93,30 @@ def main():
         color=0x3498db)
 
     # 2. 收盤後完整掃描 (週一至週五 05:30 UTC+8，美股收盤後)
-    scheduler.add_job(
-        daily_scan_job,
-        CronTrigger(day_of_week='mon-fri', hour=5, minute=30),
-        id="daily_scan_job"
-    )
+    # scheduler.add_job(
+    #     daily_scan_job,
+    #     CronTrigger(day_of_week='mon-fri', hour=5, minute=30),
+    #     id="daily_scan_job"
+    # )
 
     # 3. 盤前時機掃描 (週一至週五 21:00 UTC+8，美股 21:30 開盤前)
     timing_scan_job()
     scheduler.add_job(
         timing_scan_job,
-        CronTrigger(day_of_week='mon-fri', hour=21, minute=0),
+        CronTrigger(day_of_week='mon-fri', hour=22, minute=0, second=0, timezone=tw_tz),
         id="timing_scan_job"
     )
 
     # 4. 長期 (年尺度) 掃描 (每週日 08:00 UTC+8，週末復盤)
-    long_term_scan_job()
     scheduler.add_job(
         long_term_scan_job,
-        CronTrigger(day_of_week='sun', hour=8, minute=0),
+        CronTrigger(day_of_week='sun', hour=22, minute=0, second=0, timezone=tw_tz),
         id="long_term_scan_job"
     )
 
     # 4. 心跳通知 (每 6 小時)
+    system_engine.send_discord("系統心跳",
+            f"💓 系統正常運行中\n時間：`{datetime.now()}`", 0x2ecc71)
     scheduler.add_job(
         lambda: system_engine.send_discord("系統心跳",
             f"💓 系統正常運行中\n時間：`{datetime.now()}`", 0x2ecc71),
@@ -125,7 +126,7 @@ def main():
     )
 
     print("排程器運行中... (UTC+8)")
-    print("  05:30 收盤後掃描 | 21:00 盤前(時機+獲利回收) | 週日08:00 長期 | 每6h 心跳")
+    print("  22:00 盤前(時機+獲利回收) | 週日22:00 長期 | 每6h 心跳")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

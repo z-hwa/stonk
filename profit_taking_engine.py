@@ -280,7 +280,7 @@ class ProfitTakingEngine:
                 lines.append(f"💰 **{a['symbol']}** Score:{a['score']} | "
                              f"${a['entry']:.2f}→${a['price']:.2f} "
                              f"({a['pnl_pct']*100:+.1f}%)\n  _{details}_")
-            self.send_discord("💰 獲利回收提醒",
+            self.send_discord("[PROFIT] 💰 獲利回收提醒",
                               "\n\n".join(lines), color=0xf39c12)
 
         if reentry_alerts:
@@ -290,9 +290,10 @@ class ProfitTakingEngine:
                 details = " + ".join(f"{n}({d})" for n, _, d in a['signals'])
                 lines.append(f"🔄 **{a['symbol']}** Score:{a['score']} | "
                              f"${a['price']:.2f}\n  _{details}_")
-            self.send_discord("🔄 重新入場提醒",
+            self.send_discord("[PROFIT] 🔄 重新入場提醒",
                               "\n\n".join(lines), color=0x2ecc71)
 
+        self.send_discord("[PROFIT] 獲利策略", "\n\n掃描完成")
         logger.info("========== 掃描結束 ==========")
 
 
