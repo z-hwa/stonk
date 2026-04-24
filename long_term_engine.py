@@ -35,19 +35,22 @@ GROWTH_WEIGHTS = {
     'ROE': 1,           # Return on Equity
 }
 
-# --- Logger 設定 ---
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
+# --- Logger 設定 (延遲建立 FileHandler) ---
 logger = logging.getLogger("long_term_engine")
 logger.setLevel(logging.DEBUG)
 
-_fh = logging.FileHandler(
-    os.path.join(LOG_DIR, f"longterm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-    encoding="utf-8"
-)
-_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(_fh)
+
+def _ensure_file_handler():
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    fh = logging.FileHandler(
+        os.path.join(log_dir, f"longterm_{datetime.now().strftime('%Y%m%d')}.log"),
+        mode="a", encoding="utf-8"
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
 
 
 class LongTermEngine:
@@ -748,6 +751,7 @@ class LongTermEngine:
     # --- 主掃描 ---
 
     def run_long_term_scan(self):
+        _ensure_file_handler()
         print(f"[{datetime.now()}] 啟動長期 (年尺度) 掃描...")
         logger.info("========== 長期掃描開始 ==========")
 

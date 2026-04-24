@@ -11,19 +11,22 @@ from tqdm import tqdm
 
 load_dotenv()
 
-# --- Logger 設定 ---
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
+# --- Logger 設定 (延遲建立 FileHandler) ---
 logger = logging.getLogger("value_engine")
 logger.setLevel(logging.DEBUG)
 
-_fh = logging.FileHandler(
-    os.path.join(LOG_DIR, f"value_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-    encoding="utf-8"
-)
-_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(_fh)
+
+def _ensure_file_handler():
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    fh = logging.FileHandler(
+        os.path.join(log_dir, f"value_{datetime.now().strftime('%Y%m%d')}.log"),
+        mode="a", encoding="utf-8"
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
 
 
 class ValueEngine:
@@ -142,6 +145,7 @@ class ValueEngine:
             print(f"DC 發送失敗: {e}")
 
     def run_value_scan(self):
+        _ensure_file_handler()
         print(f"[{datetime.now()}] 啟動價值位階策略掃描...")
         logger.info("========== 價值位階策略掃描開始 ==========")
         signals = []

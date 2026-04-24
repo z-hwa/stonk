@@ -17,20 +17,25 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from positions_store import get_store
+from data_manager import update_local_cache
 
 load_dotenv()
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
 logger = logging.getLogger("profit_taking")
 logger.setLevel(logging.DEBUG)
-_fh = logging.FileHandler(
-    os.path.join(LOG_DIR, f"profit_take_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-    encoding="utf-8"
-)
-_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(_fh)
+
+
+def _ensure_file_handler():
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    fh = logging.FileHandler(
+        os.path.join(log_dir, f"profit_take_{datetime.now().strftime('%Y%m%d')}.log"),
+        mode="a", encoding="utf-8"
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
 
 
 class ProfitTakingEngine:
@@ -212,8 +217,15 @@ class ProfitTakingEngine:
 
     # --- 主掃描 (線上版) ---
 
-    def _load_ohlcv(self, symbol):
+    def _load_ohlcv(self, symbol, auto_fetch=False):
         file_path = os.path.join(self.cache_dir, f"{symbol}.parquet")
+        if not os.path.exists(file_path) and auto_fetch:
+            logger.info(f"{symbol} 缺快取,自動抓取...")
+            try:
+                update_local_cache(symbols=[symbol])
+            except Exception as e:
+                logger.error(f"{symbol} 自動抓取失敗: {e}")
+                return None
         if not os.path.exists(file_path):
             return None
         df = pd.read_parquet(file_path)
@@ -223,6 +235,7 @@ class ProfitTakingEngine:
 
     def run_profit_scan(self):
         """獲利回收以 GCP 持倉為準,重新入場以 watchlist − 持倉 為準"""
+        _ensure_file_handler()
         print(f"[{datetime.now()}] 啟動獲利回收掃描...")
         logger.info("========== 獲利回收掃描開始 ==========")
 
@@ -239,9 +252,9 @@ class ProfitTakingEngine:
         for symbol in pbar:
             pbar.set_postfix_str(symbol)
             try:
-                ohlcv = self._load_ohlcv(symbol)
+                ohlcv = self._load_ohlcv(symbol, auto_fetch=True)
                 if ohlcv is None:
-                    logger.warning(f"{symbol} 持倉但缺快取,跳過")
+                    logger.warning(f"{symbol} 持倉但快取取不到,跳過")
                     continue
                 price = float(ohlcv['close'].iloc[-1])
                 entry_price = positions[symbol].get('entry_price')
