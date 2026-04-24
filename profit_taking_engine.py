@@ -212,63 +212,80 @@ class ProfitTakingEngine:
 
     # --- 主掃描 (線上版) ---
 
+    def _load_ohlcv(self, symbol):
+        file_path = os.path.join(self.cache_dir, f"{symbol}.parquet")
+        if not os.path.exists(file_path):
+            return None
+        df = pd.read_parquet(file_path)
+        if df.empty:
+            return None
+        return self._extract_ohlcv(df)
+
     def run_profit_scan(self):
-        """讀 _positions.json，對持倉評估獲利回收"""
+        """獲利回收以 GCP 持倉為準,重新入場以 watchlist − 持倉 為準"""
         print(f"[{datetime.now()}] 啟動獲利回收掃描...")
         logger.info("========== 獲利回收掃描開始 ==========")
 
         positions = self.positions_store.load()
+        held_symbols = sorted(positions.keys())
+        reentry_symbols = sorted(set(self.watchlist) - set(held_symbols))
 
         take_profit_alerts = []
         reentry_alerts = []
 
-        pbar = tqdm(self.watchlist, desc="獲利回收", unit="檔",
+        # --- 1) 已持倉: 評估獲利回收 ---
+        pbar = tqdm(held_symbols, desc="獲利回收", unit="檔",
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-
         for symbol in pbar:
             pbar.set_postfix_str(symbol)
             try:
-                file_path = os.path.join(self.cache_dir, f"{symbol}.parquet")
-                if not os.path.exists(file_path):
+                ohlcv = self._load_ohlcv(symbol)
+                if ohlcv is None:
+                    logger.warning(f"{symbol} 持倉但缺快取,跳過")
                     continue
-                df = pd.read_parquet(file_path)
-                if df.empty:
-                    continue
-                ohlcv = self._extract_ohlcv(df)
                 price = float(ohlcv['close'].iloc[-1])
+                entry_price = positions[symbol].get('entry_price')
+                if not entry_price or entry_price <= 0:
+                    logger.warning(f"{symbol} 持倉缺 entry_price,跳過")
+                    continue
 
-                pos = positions.get(symbol, {})
-                entry_price = pos.get('entry_price')
-
-                if entry_price and entry_price > 0:
-                    # 已持有: 評估獲利回收
-                    sigs = self.evaluate_profit_take(ohlcv, entry_price)
-                    score = sum(w for _, w, _ in sigs)
-                    if score >= self.sell_notify_min:
-                        take_profit_alerts.append({
-                            'symbol': symbol, 'price': price,
-                            'entry': entry_price, 'score': score,
-                            'pnl_pct': (price - entry_price) / entry_price,
-                            'signals': sigs,
-                        })
-                    logger.info(f"{symbol:6s} | 持倉 ${entry_price:.2f}→${price:.2f} "
-                               f"({(price-entry_price)/entry_price*100:+.1f}%) | "
-                               f"PT_SELL={score} | {[n for n,_,_ in sigs]}")
-                else:
-                    # 未持有/等待重入場: 評估重入場
-                    sigs = self.evaluate_reentry(ohlcv)
-                    score = sum(w for _, w, _ in sigs)
-                    if score >= self.reentry_notify_min:
-                        reentry_alerts.append({
-                            'symbol': symbol, 'price': price,
-                            'score': score, 'signals': sigs,
-                        })
-                    logger.info(f"{symbol:6s} | 未持倉 ${price:.2f} | "
-                               f"REENTRY={score} | {[n for n,_,_ in sigs]}")
-
+                sigs = self.evaluate_profit_take(ohlcv, entry_price)
+                score = sum(w for _, w, _ in sigs)
+                if score >= self.sell_notify_min:
+                    take_profit_alerts.append({
+                        'symbol': symbol, 'price': price,
+                        'entry': entry_price, 'score': score,
+                        'pnl_pct': (price - entry_price) / entry_price,
+                        'signals': sigs,
+                    })
+                logger.info(f"{symbol:6s} | 持倉 ${entry_price:.2f}→${price:.2f} "
+                           f"({(price-entry_price)/entry_price*100:+.1f}%) | "
+                           f"PT_SELL={score} | {[n for n,_,_ in sigs]}")
             except Exception as e:
-                logger.error(f"{symbol} 出錯: {e}")
+                logger.error(f"{symbol} 獲利回收評估出錯: {e}")
+        pbar.close()
 
+        # --- 2) 非持倉 watchlist: 評估重新入場 ---
+        pbar = tqdm(reentry_symbols, desc="重新入場", unit="檔",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+        for symbol in pbar:
+            pbar.set_postfix_str(symbol)
+            try:
+                ohlcv = self._load_ohlcv(symbol)
+                if ohlcv is None:
+                    continue
+                price = float(ohlcv['close'].iloc[-1])
+                sigs = self.evaluate_reentry(ohlcv)
+                score = sum(w for _, w, _ in sigs)
+                if score >= self.reentry_notify_min:
+                    reentry_alerts.append({
+                        'symbol': symbol, 'price': price,
+                        'score': score, 'signals': sigs,
+                    })
+                logger.info(f"{symbol:6s} | 未持倉 ${price:.2f} | "
+                           f"REENTRY={score} | {[n for n,_,_ in sigs]}")
+            except Exception as e:
+                logger.error(f"{symbol} 重新入場評估出錯: {e}")
         pbar.close()
 
         # Discord

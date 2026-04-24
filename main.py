@@ -5,6 +5,7 @@ from value_engine import ValueEngine
 from trade_engine import TradeTimingEngine
 from long_term_engine import LongTermEngine
 from profit_taking_engine import ProfitTakingEngine
+from positions_store import get_store
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -65,11 +66,13 @@ def daily_scan_job():
     # timing_scan_job()
 
 def timing_scan_job():
-    """盤前交易時機掃描 + 獲利回收 (僅自選股)"""
+    """盤前交易時機掃描 + 獲利回收 (自選股 ∪ GCP 持倉)"""
     timing_list = get_timing_watchlist()
-    if not timing_list:
+    held = list(get_store().load().keys())
+    scan_list = sorted(set(timing_list) | set(held))
+    if not scan_list:
         return
-    update_local_cache(symbols=timing_list)  # 只更新自選股
+    update_local_cache(symbols=scan_list)
 
     # t_engine = TradeTimingEngine(timing_list)
     # t_engine.run_timing_scan()
