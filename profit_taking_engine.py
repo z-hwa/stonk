@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from positions_store import get_store
-from data_manager import update_local_cache
+from data_manager import _download_batch, _save_symbol_data
 
 load_dotenv()
 
@@ -220,11 +220,19 @@ class ProfitTakingEngine:
     def _load_ohlcv(self, symbol, auto_fetch=False):
         file_path = os.path.join(self.cache_dir, f"{symbol}.parquet")
         if not os.path.exists(file_path) and auto_fetch:
-            logger.info(f"{symbol} 缺快取,自動抓取...")
+            logger.info(f"{symbol} 缺快取,呼叫 yfinance 抓取 (period=2y)...")
             try:
-                update_local_cache(symbols=[symbol])
+                data = _download_batch([symbol], period="2y")
+                df = data.get(symbol)
+                if df is None:
+                    logger.warning(f"{symbol} yfinance 回傳為空 (可能被限速或 ticker 無效)")
+                elif df.empty:
+                    logger.warning(f"{symbol} yfinance 回傳 DataFrame 為空")
+                else:
+                    _save_symbol_data(symbol, df, mode='write')
+                    logger.info(f"{symbol} 抓取成功,{len(df)} 筆")
             except Exception as e:
-                logger.error(f"{symbol} 自動抓取失敗: {e}")
+                logger.error(f"{symbol} 自動抓取例外: {type(e).__name__}: {e}")
                 return None
         if not os.path.exists(file_path):
             return None
