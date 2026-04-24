@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import os
 import sqlite3
+import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 from tqdm import tqdm
@@ -13,6 +14,29 @@ CACHE_DIR = os.path.join(BASE_DIR, "cache")
 
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
+
+# --- Logger (延遲建立 FileHandler) ---
+logger = logging.getLogger("data_manager")
+logger.setLevel(logging.DEBUG)
+
+
+def _ensure_file_handler():
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+    log_dir = os.path.join(BASE_DIR, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    fh = logging.FileHandler(
+        os.path.join(log_dir, f"data_manager_{datetime.now().strftime('%Y%m%d')}.log"),
+        mode="a", encoding="utf-8"
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
+
+
+def _log(level, msg):
+    """同時寫 logger 跟 stdout (stdout 給 systemd journal/tqdm 即時觀察)"""
+    print(msg)
+    logger.log(level, msg)
 
 # --- 設定 ---
 FULL_REFRESH_DAYS = 30   # 超過 N 天沒更新就重新抓 2 年完整資料 (處理拆股/股息調整)
@@ -117,10 +141,14 @@ def _save_symbol_data(symbol, df, mode='write'):
             combined.to_parquet(path)
             return True
         except Exception as e:
-            print(f"⚠️  {symbol} 合併失敗，改為覆寫: {e}")
+            _log(logging.WARNING, f"⚠️  {symbol} 合併失敗,改為覆寫: {type(e).__name__}: {e}")
 
-    df.to_parquet(path)
-    return True
+    try:
+        df.to_parquet(path)
+        return True
+    except Exception as e:
+        _log(logging.ERROR, f"❌ {symbol} 寫入 parquet 失敗: {type(e).__name__}: {e} (path={path})")
+        return False
 
 
 def _download_batch(batch, period=None, start=None):
@@ -164,58 +192,71 @@ def update_local_cache(symbols=None):
     Args:
         symbols: 指定要更新的標的清單。None 表示更新 SQLite watchlist 全部。
     """
+    _ensure_file_handler()
+
     if symbols is None:
         symbols = _read_watchlist_from_db()
 
     if not symbols:
-        print("⚠️ 監控清單為空。")
+        _log(logging.WARNING, "⚠️ 監控清單為空。")
         return
 
-    print(f"[{datetime.now()}] 檢查 {len(symbols)} 檔快取狀態...")
+    _log(logging.INFO, f"[{datetime.now()}] 檢查 {len(symbols)} 檔快取狀態...")
 
     full_list, incremental_groups = _categorize_symbols(symbols)
     inc_total = sum(len(v) for v in incremental_groups.values())
     skip_count = len(symbols) - len(full_list) - inc_total
 
-    print(f"  📊 已最新: {skip_count} | 增量更新: {inc_total} | 全量重抓: {len(full_list)}")
+    _log(logging.INFO, f"  📊 已最新: {skip_count} | 增量更新: {inc_total} | 全量重抓: {len(full_list)}")
 
     if not full_list and not incremental_groups:
-        print(f"[{datetime.now()}] ✅ 所有標的皆為最新狀態。")
+        _log(logging.INFO, f"[{datetime.now()}] ✅ 所有標的皆為最新狀態。")
         return
 
     # === 1. 全量下載 (新標的或太舊) ===
     if full_list:
-        print(f"\n🌐 全量下載 {len(full_list)} 檔 (period=2y)...")
+        _log(logging.INFO, f"🌐 全量下載 {len(full_list)} 檔 (period=2y): {full_list}")
         for i in tqdm(range(0, len(full_list), BATCH_SIZE),
                       desc="全量下載", unit="batch"):
             batch = full_list[i:i + BATCH_SIZE]
             try:
                 data_dict = _download_batch(batch, period="2y")
+                if not data_dict:
+                    _log(logging.WARNING,
+                         f"⚠️  batch {i}~{i+len(batch)} 全量下載回傳空,ticker={batch}")
+                for sym in batch:
+                    if sym not in data_dict:
+                        _log(logging.WARNING, f"⚠️  {sym} 不在 yfinance 回傳中")
                 for sym, df in data_dict.items():
                     _save_symbol_data(sym, df, mode='write')
             except Exception as e:
-                print(f"❌ batch {i}~{i+len(batch)} 失敗: {e}")
+                _log(logging.ERROR,
+                     f"❌ batch {i}~{i+len(batch)} 全量下載例外: {type(e).__name__}: {e}")
 
     # === 2. 增量下載 (按 start_date 分組批量抓) ===
     if incremental_groups:
         total = sum(len(v) for v in incremental_groups.values())
-        print(f"\n⚡ 增量更新 {total} 檔 (按起始日分組)...")
+        _log(logging.INFO, f"⚡ 增量更新 {total} 檔 (按起始日分組)...")
 
         for start_date, group_syms in incremental_groups.items():
             days_to_fetch = (datetime.now().date() - start_date).days + 1
-            print(f"  從 {start_date} 開始 ({days_to_fetch} 天): {len(group_syms)} 檔")
+            _log(logging.INFO, f"  從 {start_date} 開始 ({days_to_fetch} 天): {len(group_syms)} 檔")
 
             for i in tqdm(range(0, len(group_syms), BATCH_SIZE),
                           desc=f"增量({start_date})", unit="batch"):
                 batch = group_syms[i:i + BATCH_SIZE]
                 try:
                     data_dict = _download_batch(batch, start=start_date)
+                    if not data_dict:
+                        _log(logging.WARNING,
+                             f"⚠️  batch {i}~{i+len(batch)} 增量下載回傳空,ticker={batch}")
                     for sym, df in data_dict.items():
                         _save_symbol_data(sym, df, mode='append')
                 except Exception as e:
-                    print(f"❌ batch {i}~{i+len(batch)} 失敗: {e}")
+                    _log(logging.ERROR,
+                         f"❌ batch {i}~{i+len(batch)} 增量下載例外: {type(e).__name__}: {e}")
 
-    print(f"\n[{datetime.now()}] ✨ 快取同步完成！")
+    _log(logging.INFO, f"[{datetime.now()}] ✨ 快取同步完成。")
 
 
 if __name__ == "__main__":
