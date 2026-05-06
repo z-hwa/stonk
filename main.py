@@ -124,7 +124,7 @@ def main():
         lambda: system_engine.send_discord("系統心跳",
             f"💓 系統正常運行中\n時間：`{datetime.now()}`", 0x2ecc71),
         'interval',
-        hours=6,
+        hours=12,
         id="heartbeat_job"
     )
 
