@@ -13,7 +13,7 @@
 set -euo pipefail
 
 GCLOUD="$(dirname "$0")/../google-cloud-sdk/bin/gcloud"
-GCP_PROJECT="${GCP_PROJECT:-gleaming-nomad-446303-j6}"
+GCP_PROJECT="${GCP_PROJECT:-storied-glazing-479907-d9}"
 GCP_ZONE="${GCP_ZONE:-us-west1-b}"
 VM_INSTANCE="${VM_INSTANCE:-stonk}"
 VM_USER="${VM_USER:-guang_zhwa}"
