@@ -21,12 +21,13 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from dotenv import load_dotenv
 
-from positions_store import get_store
+from positions_store import get_store, get_watchlist_store
 
 load_dotenv()
 
 app = FastAPI(title="Stonk Positions")
 store = get_store()
+watchlist_store = get_watchlist_store()
 
 TOKEN = os.getenv("POSITIONS_TOKEN", "").strip()
 
@@ -75,6 +76,17 @@ PAGE = """<!doctype html>
   .add button {{ background: #2563eb; color: white; border: none; }}
   .empty {{ opacity: .6; padding: 2rem 0; text-align: center; }}
   .meta {{ font-size: .8rem; opacity: .6; margin-top: 1rem; }}
+  h2 {{ font-size: 1.1rem; margin: 2rem 0 .75rem; }}
+  .chips {{ display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1rem; }}
+  .chip {{ display: flex; align-items: center; gap: .3rem; padding: .3rem .7rem;
+          background: #8881; border-radius: 20px; font-size: .9rem; font-weight: 500; }}
+  .chip button {{ border: none; background: none; color: #c33; cursor: pointer;
+                 padding: 0; font-size: 1rem; line-height: 1; }}
+  .add-wl {{ display: flex; gap: .5rem; margin-top: .5rem; }}
+  .add-wl input {{ flex: 1; padding: .5rem; border: 1px solid #8886; border-radius: 6px;
+                  background: transparent; color: inherit; font: inherit; text-transform: uppercase; }}
+  .add-wl button {{ background: #2563eb; color: white; border: none; padding: .5rem 1rem;
+                   border-radius: 6px; cursor: pointer; }}
 </style>
 </head><body>
 <h1>📈 Stonk Positions ({count})</h1>
@@ -88,11 +100,20 @@ PAGE = """<!doctype html>
   <button type="submit">Add / Update</button>
 </form>
 
+<h2>👀 Watchlist ({wl_count})</h2>
+<div class="chips">
+{chips_html}
+</div>
+<form class="add-wl" method="post" action="/watchlist/add{token_qs}">
+  <input name="symbol" placeholder="Add ticker (e.g. TSLA)" required pattern="[A-Za-z]+" autocapitalize="characters">
+  <button type="submit">Add</button>
+</form>
+
 <p class="meta">backend: {backend}</p>
 </body></html>"""
 
 
-def _render(positions: dict) -> str:
+def _render(positions: dict, watchlist: list) -> str:
     if positions:
         rows = []
         for sym in sorted(positions.keys()):
@@ -120,9 +141,26 @@ def _render(positions: dict) -> str:
     else:
         table_html = "<div class='empty'>(no positions)</div>"
 
+    if watchlist:
+        chips = []
+        for sym in watchlist:
+            chips.append(
+                f"<span class='chip'>{sym}"
+                f"<form class='inline' method='post' action='/watchlist/remove{_token_qs()}' "
+                f"onsubmit=\"return confirm('Remove {sym} from watchlist?')\">"
+                f"<input type='hidden' name='symbol' value='{sym}'>"
+                "<button type='submit'>×</button>"
+                "</form></span>"
+            )
+        chips_html = "\n".join(chips)
+    else:
+        chips_html = "<span style='opacity:.6'>（watchlist 為空）</span>"
+
     return PAGE.format(
         count=len(positions),
         table_html=table_html,
+        wl_count=len(watchlist),
+        chips_html=chips_html,
         token_qs=_token_qs(),
         today=date.today().isoformat(),
         backend=type(store).__name__,
@@ -131,7 +169,7 @@ def _render(positions: dict) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, _=Depends(_check_token)):
-    return _render(store.load())
+    return _render(store.load(), watchlist_store.load())
 
 
 @app.post("/add")
@@ -155,6 +193,26 @@ def remove(
     _=Depends(_check_token),
 ):
     store.remove(symbol.strip().upper())
+    return RedirectResponse(url=f"/{_token_qs()}", status_code=303)
+
+
+@app.post("/watchlist/add")
+def watchlist_add(
+    request: Request,
+    symbol: str = Form(...),
+    _=Depends(_check_token),
+):
+    watchlist_store.add(symbol.strip().upper())
+    return RedirectResponse(url=f"/{_token_qs()}", status_code=303)
+
+
+@app.post("/watchlist/remove")
+def watchlist_remove(
+    request: Request,
+    symbol: str = Form(...),
+    _=Depends(_check_token),
+):
+    watchlist_store.remove(symbol.strip().upper())
     return RedirectResponse(url=f"/{_token_qs()}", status_code=303)
 
 

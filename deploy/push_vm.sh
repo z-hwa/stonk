@@ -12,10 +12,13 @@
 
 set -euo pipefail
 
-GCLOUD="$(dirname "$0")/../google-cloud-sdk/bin/gcloud"
-GCP_PROJECT="${GCP_PROJECT:-storied-glazing-479907-d9}"
-GCP_ZONE="${GCP_ZONE:-us-west1-b}"
-VM_INSTANCE="${VM_INSTANCE:-stonk}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/../.env" ] && set -a && source "${SCRIPT_DIR}/../.env" && set +a
+
+GCLOUD="${SCRIPT_DIR}/../google-cloud-sdk/bin/gcloud"
+GCP_PROJECT="${GCP_PROJECT:?請在 .env 設定 GCP_PROJECT}"
+GCP_ZONE="${GCP_ZONE:?請在 .env 設定 GCP_ZONE}"
+VM_INSTANCE="${VM_INSTANCE:?請在 .env 設定 VM_INSTANCE}"
 VM_USER="${VM_USER:-guang_zhwa}"
 VM_DIR="${VM_DIR:-/opt/stonk}"
 SYNC_ENV=false

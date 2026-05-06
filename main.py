@@ -5,7 +5,7 @@ from value_engine import ValueEngine
 from trade_engine import TradeTimingEngine
 from long_term_engine import LongTermEngine
 from profit_taking_engine import ProfitTakingEngine
-from positions_store import get_store
+from positions_store import get_store, get_watchlist_store
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -27,14 +27,19 @@ def get_watchlist_from_db():
         return []
 
 def get_timing_watchlist():
-    """從 .env 讀取交易時機監控清單"""
+    """從 GCS/本機 watchlist store 讀取，若為空則 fallback 到 TIMING_WATCHLIST env var"""
+    wl = get_watchlist_store().load()
+    if wl:
+        return wl
     raw = os.getenv("TIMING_WATCHLIST", "")
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 def get_lt_watchlist():
-    """從 .env 讀取長期監控清單 (LT_WATCHLIST 為空則沿用 TIMING_WATCHLIST)"""
-    raw = os.getenv("LT_WATCHLIST", "") or os.getenv("TIMING_WATCHLIST", "")
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    """長期清單：LT_WATCHLIST env var，若空則沿用 get_timing_watchlist()"""
+    raw = os.getenv("LT_WATCHLIST", "")
+    if raw.strip():
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return get_timing_watchlist()
 
 def long_term_scan_job():
     """長期 (年尺度) 掃描，每週執行一次"""

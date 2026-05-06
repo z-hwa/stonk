@@ -90,3 +90,87 @@ def get_store() -> PositionsStore:
 
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
     return LocalPositionsStore(os.path.join(cache_dir, "_positions.json"))
+
+
+# ---------------------------------------------------------------------------
+# Watchlist store
+# ---------------------------------------------------------------------------
+
+class WatchlistStore:
+    def load(self) -> list:
+        raise NotImplementedError
+
+    def save(self, watchlist: list) -> None:
+        raise NotImplementedError
+
+    def add(self, symbol: str) -> list:
+        wl = self.load()
+        sym = symbol.upper()
+        if sym not in wl:
+            wl.append(sym)
+            wl.sort()
+            self.save(wl)
+        return wl
+
+    def remove(self, symbol: str) -> list:
+        wl = self.load()
+        wl = [s for s in wl if s != symbol.upper()]
+        self.save(wl)
+        return wl
+
+
+class LocalWatchlistStore(WatchlistStore):
+    def __init__(self, path: str):
+        self.path = path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def load(self) -> list:
+        if not os.path.exists(self.path):
+            return []
+        try:
+            with open(self.path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def save(self, watchlist: list) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(watchlist, f, indent=2)
+        os.replace(tmp, self.path)
+
+
+class GCSWatchlistStore(WatchlistStore):
+    def __init__(self, bucket: str, blob_name: str = "_watchlist.json"):
+        from google.cloud import storage  # type: ignore
+        self._client = storage.Client()
+        self._bucket = self._client.bucket(bucket)
+        self._blob_name = blob_name
+
+    def load(self) -> list:
+        blob = self._bucket.blob(self._blob_name)
+        if not blob.exists():
+            return []
+        try:
+            return json.loads(blob.download_as_text())
+        except json.JSONDecodeError:
+            return []
+
+    def save(self, watchlist: list) -> None:
+        blob = self._bucket.blob(self._blob_name)
+        blob.upload_from_string(
+            json.dumps(watchlist, indent=2),
+            content_type="application/json",
+        )
+
+
+def get_watchlist_store() -> WatchlistStore:
+    backend = os.getenv("POSITIONS_BACKEND", "local").lower()
+    if backend == "gcs":
+        bucket = os.getenv("POSITIONS_GCS_BUCKET")
+        if not bucket:
+            raise RuntimeError("POSITIONS_BACKEND=gcs 但未設定 POSITIONS_GCS_BUCKET")
+        return GCSWatchlistStore(bucket=bucket)
+
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+    return LocalWatchlistStore(os.path.join(cache_dir, "_watchlist.json"))
