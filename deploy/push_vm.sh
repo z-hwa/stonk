@@ -6,14 +6,16 @@
 #   bash deploy/push_vm.sh --env     # 同上，額外把 .env 同步到 VM
 #
 # 前置條件:
-#   - ~/.ssh/config 已設定 Host stonk (guang_zhwa@<ip>)
+#   - 已執行 gcloud auth login
 #   - VM 上 /opt/stonk 的 git remote 與本地相同
-#   - VM 上 stonk user 有 NOPASSWD sudo for systemctl restart stonk
-#     (設定方式見腳本底部說明)
+#   - VM 上已設定 NOPASSWD sudo for systemctl restart stonk
 
 set -euo pipefail
 
-VM_HOST="${VM_HOST:-stonk}"
+GCLOUD="$(dirname "$0")/../google-cloud-sdk/bin/gcloud"
+GCP_PROJECT="${GCP_PROJECT:-gleaming-nomad-446303-j6}"
+GCP_ZONE="${GCP_ZONE:-us-west1-b}"
+VM_INSTANCE="${VM_INSTANCE:-stonk}"
 VM_USER="${VM_USER:-guang_zhwa}"
 VM_DIR="${VM_DIR:-/opt/stonk}"
 SYNC_ENV=false
@@ -27,15 +29,11 @@ git push
 
 if $SYNC_ENV; then
   echo "▶ 同步 .env 到 VM..."
-  scp .env "${VM_USER}@${VM_HOST}:${VM_DIR}/.env"
+  "$GCLOUD" compute scp .env "${VM_INSTANCE}:${VM_DIR}/.env" \
+    --project "$GCP_PROJECT" --zone "$GCP_ZONE"
 fi
 
 echo "▶ VM: git pull + restart stonk..."
-ssh "${VM_USER}@${VM_HOST}" bash <<EOF
-  set -e
-  cd ${VM_DIR}
-  git pull
-  sudo systemctl restart stonk
-  echo "✅ 服務已重啟"
-  systemctl status stonk --no-pager -l | tail -5
-EOF
+"$GCLOUD" compute ssh "${VM_USER}@${VM_INSTANCE}" \
+  --project "$GCP_PROJECT" --zone "$GCP_ZONE" \
+  --command "cd ${VM_DIR} && git pull && sudo systemctl restart stonk && echo '✅ 服務已重啟' && systemctl status stonk --no-pager -l | tail -5"
