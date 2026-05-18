@@ -10,8 +10,11 @@
 
 set -euo pipefail
 
-# === CONFIG (改這裡) ===
-PROJECT="${GCP_PROJECT:?請設定 GCP_PROJECT}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "${SCRIPT_DIR}/../.env" ] && set -a && source "${SCRIPT_DIR}/../.env" && set +a
+
+# === CONFIG ===
+PROJECT="${GCP_PROJECT:?請在 .env 設定 GCP_PROJECT}"
 REGION="${GCP_REGION:-asia-east1}"          # 台灣最近: asia-east1
 SERVICE="${SERVICE:-stonk-positions}"
 BUCKET="${BUCKET:-${PROJECT}-stonk-positions}"

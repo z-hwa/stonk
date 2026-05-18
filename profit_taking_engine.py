@@ -252,9 +252,10 @@ class ProfitTakingEngine:
         reentry_symbols = sorted(set(self.watchlist) - set(held_symbols))
 
         take_profit_alerts = []
+        add_position_alerts = []
         reentry_alerts = []
 
-        # --- 1) 已持倉: 評估獲利回收 ---
+        # --- 1) 已持倉: 評估獲利回收 + 加倉機會 ---
         pbar = tqdm(held_symbols, desc="獲利回收", unit="檔",
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
         for symbol in pbar:
@@ -282,6 +283,17 @@ class ProfitTakingEngine:
                 logger.info(f"{symbol:6s} | 持倉 ${entry_price:.2f}→${price:.2f} "
                            f"({(price-entry_price)/entry_price*100:+.1f}%) | "
                            f"PT_SELL={score} | {[n for n,_,_ in sigs]}")
+
+                add_sigs = self.evaluate_reentry(ohlcv)
+                add_score = sum(w for _, w, _ in add_sigs)
+                if add_score >= self.reentry_notify_min:
+                    add_position_alerts.append({
+                        'symbol': symbol, 'price': price,
+                        'entry': entry_price, 'score': add_score,
+                        'pnl_pct': (price - entry_price) / entry_price,
+                        'signals': add_sigs,
+                    })
+                logger.info(f"{symbol:6s} | 加倉評估 ADD={add_score} | {[n for n,_,_ in add_sigs]}")
             except Exception as e:
                 logger.error(f"{symbol} 獲利回收評估出錯: {e}")
         pbar.close()
@@ -320,6 +332,17 @@ class ProfitTakingEngine:
                              f"({a['pnl_pct']*100:+.1f}%)\n  _{details}_")
             self.send_discord("[PROFIT] 💰 獲利回收提醒",
                               "\n\n".join(lines), color=0xf39c12)
+
+        if add_position_alerts:
+            add_position_alerts.sort(key=lambda x: x['score'], reverse=True)
+            lines = []
+            for a in add_position_alerts:
+                details = " + ".join(f"{n}({d})" for n, _, d in a['signals'])
+                lines.append(f"➕ **{a['symbol']}** Score:{a['score']} | "
+                             f"持倉${a['entry']:.2f} 現價${a['price']:.2f} "
+                             f"({a['pnl_pct']*100:+.1f}%)\n  _{details}_")
+            self.send_discord("[PROFIT] ➕ 加倉機會提醒",
+                              "\n\n".join(lines), color=0x3498db)
 
         if reentry_alerts:
             reentry_alerts.sort(key=lambda x: x['score'], reverse=True)
