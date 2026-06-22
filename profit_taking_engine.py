@@ -114,7 +114,7 @@ class ProfitTakingEngine:
             is_price_high = price >= float(close.tail(20).max())
             avg_vol = float(volume.rolling(20).mean().iloc[-1])
             cur_vol = float(volume.iloc[-1])
-            if is_price_high and avg_vol > 0 and cur_vol < avg_vol * 0.8:
+            if is_price_high and avg_vol > 0 and cur_vol < avg_vol * 0.7:
                 signals.append(("量價背離", 2,
                                 f"新高但量={cur_vol/avg_vol:.1f}x均量"))
 
@@ -237,6 +237,14 @@ class ProfitTakingEngine:
         if not os.path.exists(file_path):
             return None
         df = pd.read_parquet(file_path)
+        if df.empty:
+            return None
+        # 去掉今天尚未收盤的不完整 bar
+        today = pd.Timestamp.now(tz='UTC').normalize()
+        if df.index.tz is not None:
+            df = df[df.index.normalize() < today]
+        else:
+            df = df[df.index.normalize() < today.tz_localize(None)]
         if df.empty:
             return None
         return self._extract_ohlcv(df)
