@@ -57,8 +57,8 @@ class ProfitTakingEngine:
     @staticmethod
     def _calc_rsi(close, period=14):
         delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         rs = gain / loss
         return 100 - (100 / (1 + rs))
 
